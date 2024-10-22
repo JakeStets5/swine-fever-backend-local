@@ -7,6 +7,7 @@ const axios = require('axios'); // Import Axios for making HTTP requests
 const sqlite3 = require('sqlite3').verbose(); // Import SQLite3 with verbose mode for detailed error messages
 const app = express(); // Create an instance of the Express application
 const bodyParser = require('body-parser'); // Body-parser to parse incoming request bodies
+const bcrypt = require('bcrypt'); // Import bcrypt for password hashing
 const PORT = process.env.PORT; // Port from environment variables
 
 // Middleware setup
@@ -44,6 +45,48 @@ const dbDir = path.dirname(dbPath); // Get the directory of the database file
 if (!fs.existsSync(dbDir)) { // Check if the database directory exists
   fs.mkdirSync(dbDir, { recursive: true }); // Create the directory if it does not exist
 }
+
+// Sign-up endpoint
+app.post('/api/signup', (req, res) => {
+  const { email, username, password, organization } = req.body;
+
+  // Check if all required fields are provided
+  if (!username || !password || !organization) {
+    return res.status(400).json({ error: 'Organization, username, and password are required.' });
+  }
+
+  // Check if the user already exists with the same email
+  db.get('SELECT * FROM users WHERE email = ?', [email], (err, row) => {
+    if (err) {
+      console.error('Database error:', err);
+      return res.status(500).json({ error: 'Internal server error.' });
+    }
+
+    // Check if the username is already taken
+    db.get('SELECT * FROM users WHERE username = ?', [username], (err, row) => {
+      if (err) {
+        console.error('Database error:', err);
+        return res.status(500).json({ error: 'Internal server error.' });
+      }
+
+      if (row) {
+        return res.status(400).json({ error: 'Username is already taken.' });
+      }
+
+      // Hash the password for security
+      const hashedPassword = bcrypt.hashSync(password, 10);
+
+      // Insert new user into the database
+      db.run('INSERT INTO users (email, username, password, organization) VALUES (?, ?, ?, ?)', [email, username, hashedPassword, organization], function(err) {
+        if (err) {
+          console.error('Insert error:', err);
+          return res.status(500).json({ error: 'Internal server error.' });
+        }
+        return res.status(201).json({ message: 'User registered successfully.', username: username, organization: organization });
+      });
+    });
+  });
+});
 
 /**
  * Endpoint to handle submission of test data.
