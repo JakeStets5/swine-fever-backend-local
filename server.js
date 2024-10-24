@@ -46,6 +46,37 @@ if (!fs.existsSync(dbDir)) { // Check if the database directory exists
   fs.mkdirSync(dbDir, { recursive: true }); // Create the directory if it does not exist
 }
 
+// Sign-in endpoint
+app.post('/api/signin', (req, res) => {
+  const { username, password } = req.body;
+
+  // Check if all required fields are provided
+  if (!username || !password) {
+    return res.status(400).json({ error: 'Username and password are required.' });
+  }
+
+  // Query the database for the user
+  db.get('SELECT * FROM users WHERE username = ?', [username], (err, row) => {
+    if (err) {
+      console.error('Database error:', err);
+      return res.status(500).json({ error: 'Internal server error.' });
+    }
+
+    if (!row) {
+      return res.status(401).json({ error: 'Invalid username or password.' });
+    }
+
+    // Compare the password (assuming you're hashing passwords)
+    const isValidPassword = bcrypt.compareSync(password, row.password);
+    if (!isValidPassword) {
+      return res.status(401).json({ error: 'Invalid username or password.' });
+    }
+
+    // Sign-in successful
+    return res.status(200).json({ message: 'Sign-in successful.', username: row.username, organization: row.organization });
+  });
+});
+
 // Sign-up endpoint
 app.post('/api/signup', (req, res) => {
   const { email, username, password, organization } = req.body;
@@ -210,8 +241,13 @@ app.get('/retrieve-images', async (req, res) => {
 
       // List all blobs in the container and push their URLs to the images array
       for await (const blob of containerClient.listBlobsFlat()) {
-          const imageUrl = `https://${process.env.AZURE_STORAGE_ACCOUNT_NAME}.blob.core.windows.net/${containerName}/${blob.name}`;
-          images.push({ _id: blob.name, url: imageUrl }); // Store the blob name and URL in the images array
+        const blockBlobClient = containerClient.getBlockBlobClient(blob.name); //blockBlobClient is the mediator between the app and the blob storage
+        const imageUrl = `https://${process.env.AZURE_STORAGE_ACCOUNT_NAME}.blob.core.windows.net/${containerName}/${blob.name}`;
+
+        // Get the blob properties, which include metadata
+        const blobProperties = await blockBlobClient.getProperties();
+        const metadata = blobProperties.metadata; // Retrieve the metadata from the blob properties
+        images.push({ _id: blob.name, url: imageUrl, metadata: metadata || {} }); // Store the blob name and URL in the images array
       }
 
       res.json(images);
@@ -248,13 +284,8 @@ app.post('/predict', upload.single('image'), async (req, res) => {
   }
 
   try {
-    // Upload the image to Azure Blob Storage
-    const blobName = Date.now() + '-' + req.file.originalname; // Create a unique name for the uploaded file using the current timestamp
-    const containerClient = blobServiceClient.getContainerClient(containerName); // Get the container client for Azure Blob Storage
-    const blockBlobClient = containerClient.getBlockBlobClient(blobName); // Get the block blob client to upload the file
     const apiKey = process.env.AZURE_PREDICTION_KEY; // Retrieve the Azure Prediction key from environment variables
-    await blockBlobClient.upload(req.file.buffer, req.file.size); // Upload the file to Azure Blob Storage
-
+    
     // Send the image to your Azure Machine Learning model for prediction
     const modelResponse = await axios.post(
       process.env.AZURE_MODEL_ENDPOINT,
@@ -271,7 +302,6 @@ app.post('/predict', upload.single('image'), async (req, res) => {
     if (modelResponse.data) {
       const predictions = modelResponse.data.predictions; // Extract the predictions from the API response
       let highestProbability = 0.0;
-      let highestIndex = 0;
       let recognition = {
         tagName: "error",
         probability: 0.0,
@@ -285,7 +315,6 @@ app.post('/predict', upload.single('image'), async (req, res) => {
         // Keep track of the highest probability prediction
         if (probability > highestProbability) {
           highestProbability = probability;
-          highestIndex = i;
           recognition = {
             tagName: prediction.tagName,
             probability: probability,
@@ -293,9 +322,22 @@ app.post('/predict', upload.single('image'), async (req, res) => {
         }
       }
 
-      // Save the result to the database
       // Save the prediction result in the database
-      const result = recognition.tagName === 'positive' ? 1 : 0; // Determine if the result is positive or negative
+      let result;
+      switch (recognition.tagName) {
+        case 'positive':
+          result = 1;
+          break;
+        case 'negative':
+          result = 0;
+          break;
+        case 'non-image':
+          result = 2;
+          break;
+        default:
+          result = -1;
+      }
+
       const lat = req.body.lat; // Latitude from the request body
       const lng = req.body.lng; // Longitude from the request body
       const user = req.body.user; // Username from the request body
@@ -304,17 +346,38 @@ app.post('/predict', upload.single('image'), async (req, res) => {
       const currentDate = new Date(); // Get the current date
       const date = `${currentDate.getFullYear()}-${String(currentDate.getMonth() + 1).padStart(2, '0')}-${String(currentDate.getDate()).padStart(2, '0')}`; // Format the date
 
-      // Insert the prediction result into the database
-      db.run(`INSERT INTO model_results (lat, lng, result, prob, date, user, org) VALUES (?, ?, ?, ?, ?, ?, ?)`, [lat, lng, result, prob, date, user, org], function (err) {
-        if (err) {
-          console.error('Error saving test data:', err);
-          return res.status(500).json({ error: 'Failed to save data to the database' });
-        } else {
-          console.log('Test data saved successfully');
-          console.log(user);
-        }
-      });
+      if(result !== 2) {
+        // Insert the prediction result into the database
+        db.run(`INSERT INTO model_results (lat, lng, result, prob, date, user, org) VALUES (?, ?, ?, ?, ?, ?, ?)`, [lat, lng, result, prob, date, user, org], function (err) {
+          if (err) {
+            console.error('Error saving test data:', err);
+            return res.status(500).json({ error: 'Failed to save data to the database' });
+          } else {
+            console.log('Test data saved successfully');
+            console.log(user);
+          }
+        });
+      }
 
+      // Upload the image to Azure Blob Storage
+      const blobName = Date.now() + '-' + req.file.originalname; // Create a unique name for the uploaded file using the current timestamp
+      const containerClient = blobServiceClient.getContainerClient(containerName); // Get the container client for Azure Blob Storage
+      const blockBlobClient = containerClient.getBlockBlobClient(blobName); // Get the block blob client to upload the file
+
+      // Define metadata to attach to the blob
+      const metadata = {
+        result: recognition.tagName || 'unknown',
+        probability: prob.toString() || 'unknown',
+        user: user.toString() || 'anonymous',
+        org: org || 'unknown',
+        date: date.toString() || 'unknown'
+      };
+
+      // Upload the file to Azure Blob Storage with metadata
+      await blockBlobClient.upload(req.file.buffer, req.file.size, {
+        metadata: metadata
+      });
+      
       res.json(recognition); // Send the prediction result back to the client
     } else {
       res.status(500).json({ error: 'No predictions found in the response' });
